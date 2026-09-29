@@ -1,0 +1,490 @@
+---
+title: "AOL TSA"
+author: "Anthony_Hazel"
+date: "2026-06-28"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+```{r}
+library(readr)
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(car)
+library(lmtest)
+library(FinTS)
+
+# 1. DATA PREPARATION AND CLEANING
+df <- read.csv("C:/Users/user.DESKTOP-53CHBBN/Downloads/ispu_dki1 (1).csv")
+
+df <- df %>%
+  mutate(tanggal = as.Date(tanggal)) %>%
+  arrange(tanggal)
+
+df_monthly <- df %>%
+  mutate(month_col = floor_date(tanggal, "month")) %>%
+  group_by(month_col) %>%
+  summarise(pollution_avg = mean(max, na.rm = TRUE)) %>% 
+  filter(!is.na(pollution_avg))
+
+
+# 2. TIME SERIES OBJECT CREATION
+start_year <- year(min(df_monthly$month_col))
+start_month <- month(min(df_monthly$month_col))
+
+ts_pollution <- ts(df_monthly$pollution_avg, start = c(start_year, start_month), frequency = 12)
+
+plot(ts_pollution, 
+     main = "Monthly Average Air Pollution Index (DKI1 Station)",
+     ylab = "Pollution Value (Max)", 
+     xlab = "Year", 
+     col = "blue",
+     lwd = 2)
+
+
+# 3. DECOMPOSITION (TREND & SEASONALITY)
+decomposition <- stl(ts_pollution, s.window = "periodic", robust = TRUE)
+
+plot(decomposition, main = "Time Series Decomposition: Trend, Seasonality, and Residuals")
+
+
+# 4. ANOMALY DETECTION
+anomalies <- tsoutliers(ts_pollution)
+
+if(length(anomalies$index) > 0) {
+  cat("Pollution anomalies found at time series index: ")
+  print(anomalies$index)
+  
+  anomaly_times <- time(ts_pollution)[anomalies$index]
+  cat("\nTime of anomalies:\n")
+  print(anomaly_times)
+  
+  plot(ts_pollution, 
+       main = "Air Pollution Anomaly Detection",
+       ylab = "Pollution Value", 
+       xlab = "Year", 
+       col = "darkgray")
+  
+  points(anomaly_times, ts_pollution[anomalies$index],
+         col = "red", pch = 19, cex = 1.5)
+  legend("topleft", legend = c("Pollution Data", "Anomaly / Outlier"),
+         col = c("darkgray", "red"), pch = c(1, 19))
+} else {
+  cat("No anomalies detected.\n")
+}
+
+
+# 5. STATIONARITY TEST (RAW DATA)
+adf_test <- adf.test(ts_pollution)
+print(adf_test)
+
+cat("\n--> Variance Stationarity Check (Power Transform):\n")
+print(summary(powerTransform(ts_pollution)))
+
+df_monthly$year_group <- as.factor(year(df_monthly$month_col))
+levene_test <- leveneTest(pollution_avg ~ year_group, data = df_monthly)
+print(levene_test)
+
+par(mfrow=c(1,2))
+Acf(ts_pollution, main = "ACF Monthly Average Pollution")
+Pacf(ts_pollution, main = "PACF Monthly Average Pollution")
+par(mfrow=c(1,1))
+
+
+# 6. DATA SPLITTING (TRAIN & TEST) 
+cat("\n=== DATA SPLITTING ===\n")
+split_idx <- floor(0.8 * length(ts_pollution))
+
+train_data <- window(ts_pollution, end = time(ts_pollution)[split_idx])
+test_data  <- window(ts_pollution, start = time(ts_pollution)[split_idx + 1])
+
+h_test <- length(test_data)
+
+cat("Total Data  :", length(ts_pollution), "months\n")
+cat("Train Data  :", length(train_data), "months\n")
+cat("Test Data   :", h_test, "months\n\n")
+
+
+# 7. MODELING (TRAIN DATA ONLY)
+cat("\n=== 7A. ARIMA MODELING ===\n")
+# Estimating ARIMA Candidates
+arima_000 <- Arima(train_data, order = c(0,0,0))
+arima_100 <- Arima(train_data, order = c(1,0,0))
+arima_001 <- Arima(train_data, order = c(0,0,1))
+arima_101 <- Arima(train_data, order = c(1,0,1))
+arima_200 <- Arima(train_data, order = c(2,0,0))
+arima_002 <- Arima(train_data, order = c(0,0,2))
+arima_202 <- Arima(train_data, order = c(2,0,2))
+arima_auto <- auto.arima(train_data) # as a benchmark
+
+rmse_arima_candidates <- c(
+  "ARIMA(0,0,0)" = accuracy(forecast(arima_000, h = h_test), test_data)["Test set", "RMSE"],
+  "ARIMA(1,0,0)" = accuracy(forecast(arima_100, h = h_test), test_data)["Test set", "RMSE"],
+  "ARIMA(0,0,1)" = accuracy(forecast(arima_001, h = h_test), test_data)["Test set", "RMSE"],
+  "ARIMA(1,0,1)" = accuracy(forecast(arima_101, h = h_test), test_data)["Test set", "RMSE"],
+  "ARIMA(2,0,0)" = accuracy(forecast(arima_200, h = h_test), test_data)["Test set", "RMSE"],
+  "ARIMA(0,0,2)" = accuracy(forecast(arima_002, h = h_test), test_data)["Test set", "RMSE"],
+  "ARIMA(2,0,2)" = accuracy(forecast(arima_202, h = h_test), test_data)["Test set", "RMSE"],
+  "ARIMA(Auto)"  = accuracy(forecast(arima_auto, h = h_test), test_data)["Test set", "RMSE"]
+)
+
+cat("--> RMSE Evaluation Results (ARIMA):\n")
+print(sort(rmse_arima_candidates))
+
+# Select best ARIMA automatically
+best_arima_name <- names(sort(rmse_arima_candidates))[1]
+cat("\n--> Best ARIMA Model:", best_arima_name, "\n")
+best_arima <- arima_101
+
+
+
+
+cat("\n=== EXPONENTIAL SMOOTHING GRID SEARCH ===\n")
+
+# parameter yang mau dicoba (alpha, beta, gamma)
+alphas <- c(0.2, 0.4, 0.6, 0.8)
+betas  <- c(0.1, 0.2)
+gammas <- c(0.1, 0.3, 0.5)
+
+# dataframe kosong untuk simpan hasil
+ets_leaderboard <- data.frame(
+  Model = character(),
+  Alpha = numeric(),
+  Beta = numeric(),
+  Gamma = numeric(),
+  RMSE = numeric(),
+  MAE = numeric(),
+  MAPE = numeric(),
+  stringsAsFactors = FALSE
+)
+
+counter <- 1
+
+# Mulai Looping
+for(a in alphas) {
+  for(b in betas) {
+    for(g in gammas) {
+      
+      tryCatch({
+        # Fit model
+        fit <- HoltWinters(train_data, alpha = a, beta = b, gamma = g)
+        fc  <- forecast(fit, h = h_test)
+        acc <- accuracy(fc, test_data)
+        
+        # Masukkan ke tabel
+        ets_leaderboard <- rbind(ets_leaderboard, data.frame(
+          Model = paste0("HW-", counter),
+          Alpha = a,
+          Beta = b,
+          Gamma = g,
+          RMSE = round(acc["Test set", "RMSE"], 2),
+          MAE = round(acc["Test set", "MAE"], 2),
+          MAPE = round(acc["Test set", "MAPE"], 2)
+        ))
+        
+        counter <- counter + 1
+        
+      }, error = function(e){
+      })
+      
+    }
+  }
+}
+
+# dari RMSE terkecil ke terbesar
+ets_leaderboard <- ets_leaderboard[order(ets_leaderboard$RMSE), ]
+rownames(ets_leaderboard) <- NULL
+
+print(ets_leaderboard)
+
+cat("\n------------------------------------------------------\n")
+cat("Best Model:", ets_leaderboard$Model[1], 
+    "| RMSE:", ets_leaderboard$RMSE[1], "%\n")
+cat("------------------------------------------------------\n")
+
+
+
+
+best_ets <- HoltWinters(train_data, alpha = 0.2, beta = 0.1, gamma = 0.1)
+
+
+
+
+
+
+tslm_lag1 <- Arima(train_data, order=c(1,0,0), include.drift=TRUE) # Lag 1
+tslm_lag2 <- Arima(train_data, order=c(2,0,0), include.drift=TRUE) # Lag 1 & 2
+tslm_lag3 <- Arima(train_data, order=c(3,0,0), include.drift=TRUE) # Lag 1, 2 & 3
+
+rmse_tslm_candidates <- c(
+  "TSLM (Lag 1)" = accuracy(forecast(tslm_lag1, h = h_test), test_data)["Test set", "RMSE"],
+  "TSLM (Lag 2)" = accuracy(forecast(tslm_lag2, h = h_test), test_data)["Test set", "RMSE"],
+  "TSLM (Lag 3)" = accuracy(forecast(tslm_lag3, h = h_test), test_data)["Test set", "RMSE"]
+)
+
+cat("--> RMSE Evaluation Results (TSLM + Lags):\n")
+print(sort(rmse_tslm_candidates))
+
+best_tslm_name <- names(sort(rmse_tslm_candidates))[1]
+best_tslm_models <- list("TSLM (Lag 1)"=tslm_lag1, "TSLM (Lag 2)"=tslm_lag2, "TSLM (Lag 3)"=tslm_lag3)
+
+best_tslm <- best_tslm_models[[best_tslm_name]]
+cat("\n--> Best TSLM/Lag Model:", best_tslm_name, "\n")
+
+
+
+
+
+cat("\n====================================================================\n")
+cat("FAMILY: NEURAL NETWORK AUTOREGRESSION (NNAR) FAMILY\n")
+
+set.seed(123) 
+
+nnar_params <- list(
+  list(p=1, P=0, size=2), list(p=2, P=0, size=2), list(p=3, P=0, size=2),
+  list(p=2, P=0, size=3), list(p=5, P=0, size=3), list(p=7, P=0, size=4),
+  list(p=10, P=0, size=5), list(p=1, P=1, size=2), list(p=3, P=1, size=2),
+  list(p=5, P=1, size=3), list(p=7, P=1, size=4), list(p=10, P=1, size=5)
+)
+
+nnar_leaderboard <- data.frame(
+  Model = character(), RMSE = numeric(), MAE = numeric(), MAPE = numeric(),
+  stringsAsFactors = FALSE
+)
+
+nnar_models_saved <- list()
+
+tryCatch({
+  nnar_auto <- nnetar(train_data)
+  fc_auto <- forecast(nnar_auto, h = h_test)
+  acc_auto <- accuracy(fc_auto, test_data)
+  
+  nnar_leaderboard <- rbind(nnar_leaderboard, data.frame(
+    Model = "NNAR Auto",
+    RMSE = round(acc_auto["Test set", "RMSE"], 2), 
+    MAE = round(acc_auto["Test set", "MAE"], 2),  
+    MAPE = round(acc_auto["Test set", "MAPE"], 2)
+  ))
+  nnar_models_saved[["NNAR Auto"]] <- nnar_auto
+}, error = function(e){})
+
+for(params in nnar_params) {
+  p_val <- params$p
+  P_val <- params$P
+  size_val <- params$size
+  
+  model_name <- paste0("NNAR(", p_val, ",", P_val, ",", size_val, ")")
+  
+  tryCatch({
+    fit_nnar <- nnetar(train_data, p = p_val, P = P_val, size = size_val)
+    fc_nnar <- forecast(fit_nnar, h = h_test)
+    acc_nnar <- accuracy(fc_nnar, test_data)
+    
+    nnar_leaderboard <- rbind(nnar_leaderboard, data.frame(
+      Model = model_name,
+      RMSE = round(acc_nnar["Test set", "RMSE"], 2), 
+      MAE = round(acc_nnar["Test set", "MAE"], 2),  
+      MAPE = round(acc_nnar["Test set", "MAPE"], 2)
+    ))
+    
+    nnar_models_saved[[model_name]] <- fit_nnar
+    
+  }, error = function(e){})
+}
+nnar_leaderboard <- nnar_leaderboard[order(nnar_leaderboard$RMSE), ]
+rownames(nnar_leaderboard) <- NULL
+
+print(nnar_leaderboard, row.names = FALSE, right = TRUE)
+
+cat("--------------------------------------------------------------------\n")
+# model dengan RMSE terbaik
+best_nnar_model_name <- nnar_leaderboard$Model[1]
+best_nnar_rmse <- nnar_leaderboard$RMSE[1]
+
+cat("Best Model:", best_nnar_model_name, "| RMSE:", best_nnar_rmse, "\n")
+cat("====================================================================\n")
+
+best_nnar <- nnar_models_saved[[best_nnar_model_name]]
+
+
+
+
+
+
+
+cat("\n====================================================================\n")
+cat("FAMILY: NAIVE & SEASONAL NAIVE FAMILY\n")
+
+# Bikin model Naive biasa dan Seasonal Naive
+naive_regular <- naive(train_data, h = h_test)
+naive_seasonal <- snaive(train_data, h = h_test)
+
+# akurasi data test
+acc_naive <- accuracy(naive_regular, test_data)
+acc_snaive <- accuracy(naive_seasonal, test_data)
+
+# dataframe
+naive_leaderboard <- data.frame(
+  Model = c("Naive", "Seasonal Naive"),
+  RMSE = c(acc_naive["Test set", "RMSE"], acc_snaive["Test set", "RMSE"]),
+  MAE  = c(acc_naive["Test set", "MAE"], acc_snaive["Test set", "MAE"]),
+  MAPE = c(acc_naive["Test set", "MAPE"], acc_snaive["Test set", "MAPE"]),
+  stringsAsFactors = FALSE
+)
+
+# Set 2 angka di belakang koma
+naive_leaderboard$RMSE <- round(naive_leaderboard$RMSE, 2)
+naive_leaderboard$MAE  <- round(naive_leaderboard$MAE, 2)
+naive_leaderboard$MAPE <- round(naive_leaderboard$MAPE, 2)
+
+# Urut RMSE terkecil
+naive_leaderboard <- naive_leaderboard[order(naive_leaderboard$RMSE), ]
+rownames(naive_leaderboard) <- NULL
+
+# Print tabel tanpa nomor urut baris
+print(naive_leaderboard, row.names = FALSE, right = TRUE)
+
+cat("--------------------------------------------------------------------\n")
+
+# Best Model berdasarkan RMSE
+best_naive_name <- naive_leaderboard$Model[1]
+
+if(best_naive_name == "Naive") {
+  best_naive_rmse <- round(acc_naive["Test set", "RMSE"], 4)
+  model_naive <- naive_regular 
+} else {
+  best_naive_rmse <- round(acc_snaive["Test set", "RMSE"], 4)
+  model_naive <- naive_seasonal 
+}
+
+cat("Best Model:", best_naive_name, "| RMSE:", best_naive_rmse, "\n")
+cat("====================================================================\n")
+
+
+# 8. FORECASTING FOR TEST DATA (USING WINNERS)
+fc_arima <- forecast(best_arima, h = h_test)
+fc_ets   <- forecast(best_ets, h = h_test)
+fc_tslm  <- forecast(best_tslm, h = h_test)
+fc_nnar  <- forecast(best_nnar, h = h_test)
+fc_naive <- model_naive
+
+
+# 9. ACCURACY EVALUATION (FINAL LEADERBOARD)
+cat("\n==========================================\n")
+cat("FINAL MODEL EVALUATION LEADERBOARD\n")
+
+forecast_list <- list(
+  "ARIMA" = fc_arima,
+  "ETS"   = fc_ets,
+  "TSLM"  = fc_tslm,
+  "NNAR"  = fc_nnar,
+  "NAIVE" = fc_naive
+)
+
+leaderboard <- data.frame(Model = character(), RMSE = numeric(), MAE = numeric(), MAPE = numeric(), stringsAsFactors = FALSE)
+
+for (model_name in names(forecast_list)) {
+  acc <- accuracy(forecast_list[[model_name]], test_data)
+  leaderboard <- rbind(leaderboard, data.frame(
+    Model = model_name,
+    RMSE = round(acc["Test set", "RMSE"], 4),
+    MAE  = round(acc["Test set", "MAE"], 4),
+    MAPE = round(acc["Test set", "MAPE"], 4)
+  ))
+}
+
+# Sort by RMSE
+leaderboard <- leaderboard[order(leaderboard$RMSE), ]
+rownames(leaderboard) <- NULL
+print(leaderboard)
+
+best_overall <- leaderboard$Model[1]
+cat("\nTHE BEST OVERALL MODEL IS:", best_overall, "\n")
+
+
+# 10. FORECAST RESULTS (PLOTTING BEST OVERALL MODEL)
+best_forecast <- forecast_list[[best_overall]]
+
+plot(best_forecast, 
+     main = paste("Air Pollution Forecast vs Actual Data -", best_overall), 
+     ylab = "Pollution Value", xlab = "Year",
+     flty = 1, shadecols = c("#ffcccc", "#ff9999"))
+
+lines(test_data, col = "red", lwd = 2)
+legend("topleft", legend = c(paste(best_overall, "Forecast"), "Actual Data (Test)"),
+       col = c("blue", "red"), lty = 1, lwd = 2)
+
+
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------
+# 11A. PERBANDINGAN RMSE
+par(mfrow=c(1,1), mar=c(5, 5, 4, 2) + 0.1)
+
+bar_colors <- ifelse(leaderboard$Model == best_overall, "firebrick", "steelblue")
+
+bp <- barplot(leaderboard$RMSE, 
+              names.arg = leaderboard$Model, 
+              col = bar_colors,
+              main = "Leaderboard RMSE (Semua Model pada Data Test)",
+              ylab = "Nilai RMSE",
+              xlab = "Metode Forecast",
+              ylim = c(0, max(leaderboard$RMSE) * 1.2), # Naikin batas atas biar text ngga kepotong
+              las = 1)
+
+text(x = bp, y = leaderboard$RMSE, 
+     label = round(leaderboard$RMSE, 2), 
+     pos = 3, cex = 1, col = "black", font = 2)
+
+legend("topright", legend = c(paste("Best Model:", best_overall), "Kandidat Lain"), 
+       fill = c("firebrick", "steelblue"), cex = 0.9)
+
+
+
+
+
+
+par(mfrow=c(2,3)) 
+
+plot_forecast_individual <- function(fc_model, model_name, test_data) {
+  plot(fc_model, 
+       main = paste("Forecast:", model_name), 
+       ylab = "Pollution Value", xlab = "Year",
+       flty = 1, shadecols = c("#ffcccc", "#ff9999"))
+  lines(test_data, col = "red", lwd = 2)
+  legend("topleft", legend = c("Forecast", "Actual Data"),
+         col = c("blue", "red"), lty = 1, lwd = 2, cex = 0.7)
+}
+
+# Generate plot masing-masing
+plot_forecast_individual(fc_arima, "ARIMA", test_data)
+plot_forecast_individual(fc_ets, "ETS", test_data)
+plot_forecast_individual(fc_tslm, "TSLM", test_data)
+plot_forecast_individual(fc_nnar, "NNAR", test_data)
+plot_forecast_individual(fc_naive, "NAIVE", test_data)
+
+par(mfrow=c(1,1))
+
+
+```
+
+
